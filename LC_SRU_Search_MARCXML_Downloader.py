@@ -1,338 +1,425 @@
-# Daily LC SRU Search MARCXML Downloader
-# Queries the Library of Congress SRU endpoint and saves new MARCXML records.
+#!/usr/bin/env python3
 # Created with Claude Sonnet 4.6
-# ============================
-# HOW TO RUN
-# ============================
-#
-# REQUIREMENTS
-#   Python 3.10 or newer. Install dependencies with:
-#     pip install requests defusedxml
-#
-# INPUT
-#   Place a CSV file named queries.csv in the same directory as this script.
-#   The CSV must have a "Title" column containing one CQL query per row, e.g.:
-#
-#     Title
-#     dc.title = "Moby Dick"
-#     dc.creator = "Hemingway"
-#
-# RUNNING THE SCRIPT
-#   From any directory, run:
-#     python path/to/lc_sru_downloader.py
-#
-# OUTPUT
-#   output/YYYY-MM-DD/      — MARCXML files, one per query with new records
-#   logs/sru_query_log.csv  — per-run log of every query and its results
-#   logs/seen_marc_ids.csv  — deduplication record of all harvested record IDs
-#   logs/sru_run_log.txt    — detailed run log with timestamps
-#
-# CUSTOM PATHS (optional)
-#   Override any default path using environment variables before running:
-#     SRU_QUERY_FILE  — path to your queries CSV  (default: queries.csv)
-#     SRU_OUTPUT_DIR  — where to write MARCXML     (default: output/)
-#     SRU_LOG_DIR     — where to write logs        (default: logs/)
-#
-#   Example (Windows):
-#     set SRU_QUERY_FILE=C:\data\my_queries.csv
-#     python lc_sru_downloader.py
-#
-#   Example (macOS/Linux):
-#     SRU_QUERY_FILE=/data/my_queries.csv python lc_sru_downloader.py
-# ============================
+"""
+loc_sru_query.py
+----------------
+Reads a CSV file containing either a "title" or "ISBN" column, queries each
+value against the Library of Congress SRU server, downloads the MARCXML for
+matched records, and writes a timestamped log file.
 
-from __future__ import annotations
+Usage:
+    python loc_sru_query.py <input.csv> [--output-dir <dir>]
 
+Arguments:
+    input.csv       Path to the input CSV file.
+    --output-dir    Directory for MARCXML files and the log (default: ./loc_output)
+"""
+
+import argparse
 import csv
 import logging
 import os
 import re
+import sys
 import time
 import random
-import unicodedata
+import urllib.parse
+import urllib.request
+import urllib.error
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
-import requests
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-try:
-    from defusedxml import ElementTree as ET  # safer XML parsing
-except ImportError:
-    import xml.etree.ElementTree as ET  # fallback if defusedxml not installed
+SRU_BASE_URL = "http://lx2.loc.gov:210/lcdb"
+SRU_VERSION = "1.1"
+MAX_RECORDS = 10          # Maximum records to retrieve / display per query
+MAX_RETRIES = 3           # Maximum retry attempts for a failed query
+RETRY_WAIT_MIN = 6        # Minimum seconds between retries
+RETRY_WAIT_MAX = 10       # Maximum seconds between retries (adds jitter)
+POLITE_WAIT_MIN = 10      # Minimum polite crawl delay between queries (seconds)
+POLITE_WAIT_MAX = 15      # Maximum polite crawl delay between queries (seconds)
 
-# ============================
-# CONFIGURATION
-# All values can be overridden with environment variables for portability.
-# Defaults are resolved relative to the script's own directory so the script
-# works correctly regardless of which directory you run it from.
-# ============================
+# Accepted column header variants (lowercased for comparison)
+TITLE_HEADERS = {"title"}
+ISBN_HEADERS = {"isbn", "isbn-13", "isbn-10", "isbn10", "isbn13"}
 
-# Directory containing this script — used to anchor all default paths.
-SCRIPT_DIR = Path(__file__).resolve().parent
+MARCXML_NS = "http://www.loc.gov/MARC21/slim"
 
-# Path to a CSV file with a "Title" column containing one SRU CQL query per row.
-QUERY_FILE = Path(os.environ.get("SRU_QUERY_FILE", SCRIPT_DIR / "queries.csv"))
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
 
-# Root directory for output MARCXML files (organised into daily sub-folders).
-OUTPUT_DIR = Path(os.environ.get("SRU_OUTPUT_DIR", SCRIPT_DIR / "output"))
+def setup_logging(output_dir: Path) -> logging.Logger:
+    """Configure a logger that writes to both stdout and a timestamped log file."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = output_dir / f"loc_sru_query_{timestamp}.log"
 
-# Directory for persistent logs and the seen-IDs deduplication file.
-LOG_DIR = Path(os.environ.get("SRU_LOG_DIR", SCRIPT_DIR / "logs"))
+    logger = logging.getLogger("loc_sru")
+    logger.setLevel(logging.DEBUG)
 
-# LC SRU base URL (Z39.50/SRU gateway).
-# Note: LC's SRU endpoint does not support HTTPS — http:// is intentional.
-BASE_URL = os.environ.get("SRU_BASE_URL", "http://lx2.loc.gov:210/lcdb")
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S")
 
-# Polite crawl delay range (seconds) – please be kind to LC's servers.
-MIN_DELAY = int(os.environ.get("SRU_MIN_DELAY", 8))
-MAX_DELAY = int(os.environ.get("SRU_MAX_DELAY", 12))
+    # Console handler
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
 
-MAX_RETRIES = int(os.environ.get("SRU_MAX_RETRIES", 3))
-BACKOFF_BASE = int(os.environ.get("SRU_BACKOFF_BASE", 6))
+    # File handler
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
 
-USER_AGENT = "LCSRUHarvester/1.0 (+https://example.org)"
+    logger.info("Log file: %s", log_path)
+    return logger
 
-# ============================
-# SETUP
-# ============================
 
-def setup() -> tuple[Path, Path, Path, str]:
-    """Create required directories, configure logging, and return runtime paths."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    query_log_csv = LOG_DIR / "sru_query_log.csv"
-    seen_ids_csv  = LOG_DIR / "seen_marc_ids.csv"
-    log_file      = LOG_DIR / "sru_run_log.txt"
-    day_folder    = OUTPUT_DIR / today
+# ---------------------------------------------------------------------------
+# CSV helpers
+# ---------------------------------------------------------------------------
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    day_folder.mkdir(exist_ok=True)
-
-    logging.basicConfig(
-        filename=str(log_file),
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
+def detect_query_column(fieldnames: list[str]) -> tuple[str, str]:
+    """
+    Inspect CSV headers and return (canonical_type, actual_header).
+    canonical_type is either 'title' or 'isbn'.
+    Raises ValueError if neither is found.
+    """
+    for name in fieldnames:
+        lower = name.strip().lower()
+        if lower in TITLE_HEADERS:
+            return ("title", name)
+        if lower in ISBN_HEADERS:
+            return ("isbn", name)
+    raise ValueError(
+        f"CSV must contain a 'title' or ISBN column. Found: {fieldnames}"
     )
 
-    return day_folder, query_log_csv, seen_ids_csv, today
 
-
-# ============================
-# CSV HELPERS
-# ============================
-
-def ensure_csv(path: Path, header: list[str]) -> None:
-    """Write the header row if the CSV does not yet exist or is empty."""
-    if not path.exists() or path.stat().st_size == 0:
-        with path.open("w", encoding="utf-8", newline="") as fh:
-            csv.writer(fh).writerow(header)
-
-
-def load_seen_ids(path: Path) -> set[str]:
-    """Return the set of MARC record IDs already harvested in previous runs."""
-    seen: set[str] = set()
-    if path.exists():
-        with path.open("r", encoding="utf-8", newline="") as fh:
-            reader = csv.reader(fh)
-            next(reader, None)  # skip header
-            for row in reader:
-                if row:
-                    seen.add(row[0])
-    return seen
-
-
-def append_seen_ids(path: Path, new_ids: list[str], today: str) -> None:
-    """Append newly harvested record IDs with today's date."""
-    if not new_ids:
-        return
-    with path.open("a", encoding="utf-8", newline="") as fh:
-        writer = csv.writer(fh)
-        for rid in new_ids:
-            writer.writerow([rid, today])
-
-
-# ============================
-# QUERY HELPERS
-# ============================
-
-def load_queries(path: Path) -> list[str]:
-    """Read CQL queries from the 'Title' column of a CSV file."""
-    with path.open("r", encoding="utf-8", newline="") as fh:
+def read_queries(csv_path: Path) -> tuple[str, list[str]]:
+    """
+    Parse the CSV and return (query_type, list_of_query_strings).
+    Empty / whitespace-only values are skipped.
+    """
+    with open(csv_path, newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
-        return [row["Title"].strip() for row in reader if row["Title"].strip()]
+        if reader.fieldnames is None:
+            raise ValueError("CSV file appears to be empty.")
+        query_type, col = detect_query_column(list(reader.fieldnames))
+        queries = [
+            row[col].strip()
+            for row in reader
+            if row[col].strip()
+        ]
+    return query_type, queries
 
 
-def query_to_filename(query: str) -> str:
-    """
-    Convert a CQL query string into a safe, human-readable filename stem.
+# ---------------------------------------------------------------------------
+# SRU helpers
+# ---------------------------------------------------------------------------
 
-    Steps:
-      1. Strip characters illegal on Windows/macOS/Linux filesystems.
-      2. Collapse non-alphanumeric runs to underscores.
-      3. Normalise Unicode to ASCII.
-    """
-    name = re.sub(r'[\\/:*?"<>|]', " ", query)
-    name = re.sub(r"[^A-Za-z0-9]+", " ", name)
-    name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
-    name = re.sub(r"\s+", "_", name).strip("_")
-    return name
+def build_sru_url(query_type: str, value: str) -> str:
+    """Construct an SRU searchRetrieve URL for the given query type and value."""
+    if query_type == "title":
+        # Escape any internal double-quotes before wrapping the full title in a
+        # CQL quoted string. This ensures the colon in "Title: Subtitle" is
+        # passed through as literal text rather than being misread as CQL syntax.
+        escaped = value.replace('"', '\\"')
+        cql = f'dc.title = "{escaped}"'
+    else:
+        # Standard ISBN index
+        clean_isbn = re.sub(r"[-\s]", "", value)   # strip hyphens / spaces
+        cql = f'bath.isbn = "{clean_isbn}"'
 
-
-# ============================
-# HTTP / SRU FETCHING
-# ============================
-
-def fetch_sru(query: str) -> str | None:
-    """
-    Fetch MARCXML from the LC SRU endpoint for a single CQL query.
-
-    The query is passed as a raw string; requests handles all URL encoding
-    safely via the `params` dict, preventing any injection via crafted queries.
-    Retries with exponential back-off on transient failures.
-
-    Args:
-        query: A raw (un-encoded) CQL query string.
-
-    Returns:
-        The raw XML response text, or None if all retries are exhausted.
-    """
     params = {
-        "version": "1.1",
         "operation": "searchRetrieve",
-        "query": query,
-        "startRecord": "1",
-        "maximumRecords": "25",
+        "version": SRU_VERSION,
+        "query": cql,
+        "maximumRecords": str(MAX_RECORDS),
         "recordSchema": "marcxml",
     }
-    headers = {"User-Agent": USER_AGENT}
+    return f"{SRU_BASE_URL}?{urllib.parse.urlencode(params)}"
+
+
+def fetch_url(url: str, logger: logging.Logger) -> bytes | None:
+    """
+    Perform an HTTP GET and return the raw response body.
+    Returns None on network / HTTP error (caller handles retries).
+    """
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "loc_sru_query/1.0 (library research tool)"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as exc:
+        logger.warning("HTTP %s for URL: %s", exc.code, url)
+    except urllib.error.URLError as exc:
+        logger.warning("URL error (%s) for: %s", exc.reason, url)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Unexpected error fetching URL: %s", exc)
+    return None
+
+
+def parse_sru_response(raw_xml: bytes) -> tuple[int, list[ET.Element]]:
+    """
+    Parse an SRU response and return (number_of_records, list_of_record_elements).
+    The record elements are the <record> children inside each <recordData>.
+    """
+    root = ET.fromstring(raw_xml)
+    ns = {"sru": "http://www.loc.gov/zing/srw/"}
+
+    # numberOfRecords is a required element in SRU 1.1
+    num_el = root.find("sru:numberOfRecords", ns)
+    total = int(num_el.text.strip()) if num_el is not None and num_el.text else 0
+
+    records = []
+    for rd in root.findall(".//sru:recordData", ns):
+        # Each recordData contains one <record> in MARCXML namespace
+        rec = rd.find(f"{{{MARCXML_NS}}}record")
+        if rec is not None:
+            records.append(rec)
+
+    return total, records
+
+
+def get_marc_title(record: ET.Element) -> str:
+    """Extract the title from MARC field 245 subfield a (best-effort)."""
+    for field in record.findall(f"{{{MARCXML_NS}}}datafield[@tag='245']"):
+        for sub in field.findall(f"{{{MARCXML_NS}}}subfield[@code='a']"):
+            return sub.text.strip() if sub.text else ""
+    return "(title not found)"
+
+
+def get_marc_control_number(record: ET.Element) -> str:
+    """Return the MARC 001 control number, or a placeholder."""
+    cf = record.find(f"{{{MARCXML_NS}}}controlfield[@tag='001']")
+    return cf.text.strip() if (cf is not None and cf.text) else "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Query + download logic
+# ---------------------------------------------------------------------------
+
+def query_with_retries(
+    query_type: str,
+    value: str,
+    logger: logging.Logger,
+) -> tuple[int, list[ET.Element]] | None:
+    """
+    Query the SRU server with up to MAX_RETRIES retries.
+    Returns (total_found, records) on success, or None if all attempts fail.
+    """
+    url = build_sru_url(query_type, value)
+    logger.debug("SRU URL: %s", url)
 
     for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            response = requests.get(BASE_URL, params=params, headers=headers, timeout=30)
-            response.raise_for_status()
-            return response.text
+        raw = fetch_url(url, logger)
+        if raw is not None:
+            try:
+                return parse_sru_response(raw)
+            except ET.ParseError as exc:
+                logger.warning("XML parse error on attempt %d: %s", attempt, exc)
 
-        except requests.RequestException as exc:
-            logging.warning("Attempt %d/%d failed for query %r: %s", attempt, MAX_RETRIES, query, exc)
-            if attempt == MAX_RETRIES:
-                logging.error("All retries exhausted for query %r.", query)
-                return None
-            time.sleep(BACKOFF_BASE * (2 ** (attempt - 1)))
+        if attempt < MAX_RETRIES:
+            wait = random.uniform(RETRY_WAIT_MIN, RETRY_WAIT_MAX)
+            logger.info(
+                "  Attempt %d/%d failed – retrying in %.1f s …",
+                attempt, MAX_RETRIES, wait,
+            )
+            time.sleep(wait)
 
-    return None  # unreachable, but satisfies type checkers
+    logger.error("All %d attempts failed for: %s", MAX_RETRIES, value)
+    return None
 
 
-# ============================
-# MARCXML PARSING / WRITING
-# ============================
-
-def parse_records(xml_text: str) -> list[tuple[str | None, ET.Element]]:
+def save_marcxml(
+    record: ET.Element,
+    output_dir: Path,
+    stem: str,
+    index: int,
+    logger: logging.Logger,
+) -> Path:
     """
-    Parse MARCXML and return a list of (record_id, element) tuples.
-    record_id is the value of the 001 control field, or None if absent.
+    Wrap a single MARC record element in a MARCXML collection and save it.
+    Returns the path of the saved file.
     """
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError as exc:
-        logging.error("XML parse error: %s", exc)
-        return []
+    # Build a minimal MARCXML wrapper
+    collection = ET.Element(
+        "collection",
+        attrib={"xmlns": MARCXML_NS},
+    )
+    collection.append(record)
+    tree = ET.ElementTree(collection)
+    ET.indent(tree, space="  ")   # Python ≥ 3.9
 
-    results: list[tuple[str | None, ET.Element]] = []
-    ns = "{http://www.loc.gov/MARC21/slim}"
-    for record in root.findall(f".//{ns}record"):
-        record_id = next(
-            (cf.text.strip()
-             for cf in record.findall(f"{ns}controlfield")
-             if cf.get("tag") == "001" and cf.text),
-            None,
+    safe_stem = re.sub(r'[^\w\-]+', '_', stem)[:80]   # filesystem-safe name
+    filename = output_dir / f"{safe_stem}_{index}.xml"
+
+    with open(filename, "wb") as fh:
+        tree.write(fh, xml_declaration=True, encoding="utf-8")
+
+    logger.debug("Saved MARCXML: %s", filename)
+    return filename
+
+
+def process_query(
+    query_type: str,
+    value: str,
+    output_dir: Path,
+    logger: logging.Logger,
+) -> dict:
+    """
+    Run one query end-to-end and return a result summary dict.
+    """
+    result = {
+        "value": value,
+        "query_type": query_type,
+        "status": None,         # 'not_found' | 'found' | 'multiple' | 'error'
+        "total": 0,
+        "files": [],
+        "flag_review": False,
+    }
+
+    logger.info("Querying %s: %s", query_type.upper(), value)
+    response = query_with_retries(query_type, value, logger)
+
+    if response is None:
+        result["status"] = "error"
+        logger.error("  → FAILED (no response after retries)")
+        return result
+
+    total, records = response
+
+    if total == 0:
+        result["status"] = "not_found"
+        logger.info("  → NOT FOUND")
+        return result
+
+    result["total"] = total
+
+    if total > 1:
+        result["status"] = "multiple"
+        result["flag_review"] = True
+        logger.warning(
+            "  → MULTIPLE RESULTS (%d total, downloading up to %d) – FLAGGED FOR REVIEW",
+            total, len(records),
         )
-        results.append((record_id, record))
-    return results
+        for i, rec in enumerate(records, start=1):
+            logger.info("    [%d] %s  (control# %s)",
+                        i, get_marc_title(rec), get_marc_control_number(rec))
+    else:
+        result["status"] = "found"
+        logger.info("  → FOUND: %s", get_marc_title(records[0]))
+
+    # Download MARCXML for all retrieved records
+    for i, rec in enumerate(records, start=1):
+        path = save_marcxml(rec, output_dir, value, i, logger)
+        result["files"].append(str(path))
+
+    return result
 
 
-def build_marcxml_collection(records: list[ET.Element]) -> str:
-    """Wrap a list of MARC record elements in a <collection> and serialise to UTF-8 XML."""
-    collection = ET.Element("{http://www.loc.gov/MARC21/slim}collection")
-    collection.extend(records)
-    return ET.tostring(collection, encoding="utf-8", xml_declaration=True).decode("utf-8")
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Query the Library of Congress SRU server and download MARCXML.",
+    )
+    parser.add_argument("csv_file", help="Input CSV file with Title or ISBN column.")
+    parser.add_argument(
+        "--output-dir", default="loc_output",
+        help="Directory for MARCXML files and the log (default: ./loc_output).",
+    )
+    return parser.parse_args()
 
 
-# ============================
-# MAIN
-# ============================
+def print_summary(results: list[dict], logger: logging.Logger) -> None:
+    """Log a concise summary table after all queries are complete."""
+    found     = [r for r in results if r["status"] in ("found", "multiple")]
+    not_found = [r for r in results if r["status"] == "not_found"]
+    errors    = [r for r in results if r["status"] == "error"]
+    flagged   = [r for r in results if r["flag_review"]]
+
+    logger.info("=" * 60)
+    logger.info("SUMMARY")
+    logger.info("  Total queries  : %d", len(results))
+    logger.info("  Found          : %d", len(found))
+    logger.info("  Not found      : %d", len(not_found))
+    logger.info("  Errors         : %d", len(errors))
+    logger.info("  Flagged review : %d", len(flagged))
+
+    if flagged:
+        logger.info("")
+        logger.info("Items flagged for review (multiple matches):")
+        for r in flagged:
+            logger.info("  • %s  (%d results)", r["value"], r["total"])
+
+    if not_found:
+        logger.info("")
+        logger.info("Items not found:")
+        for r in not_found:
+            logger.info("  • %s", r["value"])
+
+    if errors:
+        logger.info("")
+        logger.info("Items that errored:")
+        for r in errors:
+            logger.info("  • %s", r["value"])
+
+    logger.info("=" * 60)
+
 
 def main() -> None:
-    day_folder, query_log_csv, seen_ids_csv, today = setup()
+    args = parse_args()
 
-    ensure_csv(query_log_csv, ["date", "query", "xml_file_path", "total_records",
-                              "new_records", "skipped_records", "error_message"])
-    ensure_csv(seen_ids_csv, ["record_id", "first_seen_date"])
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    seen_ids = load_seen_ids(seen_ids_csv)
-    logging.info("Loaded %d previously seen record IDs.", len(seen_ids))
+    logger = setup_logging(output_dir)
+    logger.info("Starting LOC SRU query script")
+    logger.info("Input file  : %s", args.csv_file)
+    logger.info("Output dir  : %s", output_dir.resolve())
 
+    # --- Read CSV ---
     try:
-        queries = load_queries(QUERY_FILE)
-    except FileNotFoundError:
-        logging.error("Query file not found: %s", QUERY_FILE)
-        print(f"ERROR: Query file not found: {QUERY_FILE}")
-        return
+        query_type, queries = read_queries(Path(args.csv_file))
+    except (FileNotFoundError, ValueError) as exc:
+        logger.error("Could not read CSV: %s", exc)
+        sys.exit(1)
 
-    with query_log_csv.open("a", encoding="utf-8", newline="") as log_fh:
-        log_writer = csv.writer(log_fh)
+    logger.info("Query type  : %s", query_type.upper())
+    logger.info("Items found : %d", len(queries))
 
-        for query in queries:
-            print(f"[SEARCH] {query}")
-            logging.info("Starting query: %s", query)
+    if not queries:
+        logger.warning("No queryable values found in CSV. Exiting.")
+        sys.exit(0)
 
-            xml_file_path = ""
-            total = new_count = skipped = 0
-            error_msg = ""
+    # --- Process each query ---
+    results = []
+    for idx, value in enumerate(queries, start=1):
+        logger.info("-" * 60)
+        logger.info("[%d/%d]", idx, len(queries))
+        result = process_query(query_type, value, output_dir, logger)
+        results.append(result)
 
-            xml_text = fetch_sru(query)
+        # Polite crawl delay – skip after the last item
+        if idx < len(queries):
+            wait = random.uniform(POLITE_WAIT_MIN, POLITE_WAIT_MAX)
+            logger.debug("Waiting %.1f s before next query …", wait)
+            time.sleep(wait)
 
-            if xml_text is None:
-                error_msg = "Failed to retrieve SRU response after retries."
-                print(f"  → ERROR: {error_msg}")
-                logging.error(error_msg)
-
-            else:
-                record_tuples = parse_records(xml_text)
-                total = len(record_tuples)
-
-                new_elements: list[ET.Element] = []
-                new_ids: list[str] = []
-
-                for rec_id, elem in record_tuples:
-                    if rec_id is not None and rec_id in seen_ids:
-                        skipped += 1
-                        continue
-                    new_elements.append(elem)
-                    new_count += 1
-                    if rec_id is not None:
-                        new_ids.append(rec_id)
-                        seen_ids.add(rec_id)
-
-                if new_elements:
-                    out_file = day_folder / f"{query_to_filename(query)}_NEW.marcxml.xml"
-                    out_file.write_text(build_marcxml_collection(new_elements), encoding="utf-8")
-                    xml_file_path = str(out_file)
-                    print(f"  → Wrote {new_count} new records to {out_file}")
-                    logging.info("Wrote %d new records for query %r to %s", new_count, query, out_file)
-                    append_seen_ids(seen_ids_csv, new_ids, today)
-                else:
-                    print("  → No new records found for this query.")
-                    logging.info("No new records for query %r.", query)
-
-            log_writer.writerow([today, query, xml_file_path,
-                                  total, new_count, skipped, error_msg])
-
-            delay = random.uniform(MIN_DELAY, MAX_DELAY)
-            print(f"  → Waiting {delay:.1f}s before next query …")
-            time.sleep(delay)
-
-    logging.info("=== Completed daily SRU harvesting run ===")
-    print("\n*** DONE ***")
+    # --- Summary ---
+    print_summary(results, logger)
+    logger.info("Done.")
 
 
 if __name__ == "__main__":
