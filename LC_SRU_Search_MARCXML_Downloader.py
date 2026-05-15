@@ -1,6 +1,45 @@
 # Daily LC SRU Search MARCXML Downloader
 # Queries the Library of Congress SRU endpoint and saves new MARCXML records.
 # Created with Claude Sonnet 4.6
+# ============================
+# HOW TO RUN
+# ============================
+#
+# REQUIREMENTS
+#   Python 3.10 or newer. Install dependencies with:
+#     pip install requests defusedxml
+#
+# INPUT
+#   Place a CSV file named queries.csv in the same directory as this script.
+#   The CSV must have a "Title" column containing one CQL query per row, e.g.:
+#
+#     Title
+#     dc.title = "Moby Dick"
+#     dc.creator = "Hemingway"
+#
+# RUNNING THE SCRIPT
+#   From any directory, run:
+#     python path/to/lc_sru_downloader.py
+#
+# OUTPUT
+#   output/YYYY-MM-DD/      — MARCXML files, one per query with new records
+#   logs/sru_query_log.csv  — per-run log of every query and its results
+#   logs/seen_marc_ids.csv  — deduplication record of all harvested record IDs
+#   logs/sru_run_log.txt    — detailed run log with timestamps
+#
+# CUSTOM PATHS (optional)
+#   Override any default path using environment variables before running:
+#     SRU_QUERY_FILE  — path to your queries CSV  (default: queries.csv)
+#     SRU_OUTPUT_DIR  — where to write MARCXML     (default: output/)
+#     SRU_LOG_DIR     — where to write logs        (default: logs/)
+#
+#   Example (Windows):
+#     set SRU_QUERY_FILE=C:\data\my_queries.csv
+#     python lc_sru_downloader.py
+#
+#   Example (macOS/Linux):
+#     SRU_QUERY_FILE=/data/my_queries.csv python lc_sru_downloader.py
+# ============================
 
 from __future__ import annotations
 
