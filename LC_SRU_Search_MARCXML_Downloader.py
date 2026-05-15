@@ -1,6 +1,5 @@
 # Daily LC SRU Search MARCXML Downloader
 # Queries the Library of Congress SRU endpoint and saves new MARCXML records.
-# Created with Claude Sonnet 4.6
 
 from __future__ import annotations
 
@@ -31,8 +30,8 @@ except ImportError:
 # Directory containing this script — used to anchor all default paths.
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-# Path to a plain-text file with one SRU CQL query per line.
-QUERY_FILE = Path(os.environ.get("SRU_QUERY_FILE", SCRIPT_DIR / "queries.txt"))
+# Path to a CSV file with a "Title" column containing one SRU CQL query per row.
+QUERY_FILE = Path(os.environ.get("SRU_QUERY_FILE", SCRIPT_DIR / "queries.csv"))
 
 # Root directory for output MARCXML files (organised into daily sub-folders).
 OUTPUT_DIR = Path(os.environ.get("SRU_OUTPUT_DIR", SCRIPT_DIR / "output"))
@@ -117,9 +116,10 @@ def append_seen_ids(path: Path, new_ids: list[str], today: str) -> None:
 # ============================
 
 def load_queries(path: Path) -> list[str]:
-    """Read raw CQL queries from a plain-text file, one per line."""
-    with path.open("r", encoding="utf-8") as fh:
-        return [line.strip().strip('"') for line in fh if line.strip()]
+    """Read CQL queries from the 'Title' column of a CSV file."""
+    with path.open("r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        return [row["Title"].strip() for row in reader if row["Title"].strip()]
 
 
 def query_to_filename(query: str) -> str:
