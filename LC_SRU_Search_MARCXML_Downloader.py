@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# Created with Claude Sonnet 4.6
 """
 loc_sru_query.py
 ----------------
@@ -126,10 +125,13 @@ def read_queries(csv_path: Path) -> tuple[str, list[str]]:
 def build_sru_url(query_type: str, value: str) -> str:
     """Construct an SRU searchRetrieve URL for the given query type and value."""
     if query_type == "title":
-        # Escape any internal double-quotes before wrapping the full title in a
-        # CQL quoted string. This ensures the colon in "Title: Subtitle" is
-        # passed through as literal text rather than being misread as CQL syntax.
-        escaped = value.replace('"', '\\"')
+        # LC MARC convention requires a space on both sides of a colon that
+        # separates a main title from its subtitle (e.g. "Title : Subtitle").
+        # Normalise any colon in the input to that form before querying, so the
+        # string matches the catalogued form exactly.
+        # Also escape any internal double-quotes to keep the CQL string valid.
+        normalised = re.sub(r'\s*:\s*', ' : ', value)
+        escaped = normalised.replace('"', '\\"')
         cql = f'dc.title = "{escaped}"'
     else:
         # Standard ISBN index
