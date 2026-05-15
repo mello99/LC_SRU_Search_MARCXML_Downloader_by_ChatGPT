@@ -1,5 +1,6 @@
 # Daily LC SRU Search MARCXML Downloader
 # Queries the Library of Congress SRU endpoint and saves new MARCXML records.
+# Created with Claude Sonnet 4.6
 
 from __future__ import annotations
 
