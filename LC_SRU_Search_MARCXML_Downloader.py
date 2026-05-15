@@ -1,6 +1,5 @@
 # Daily LC SRU Search MARCXML Downloader
 # Queries the Library of Congress SRU endpoint and saves new MARCXML records.
-# Created with Claude Sonnet 4.6
 
 from __future__ import annotations
 
@@ -21,16 +20,21 @@ import requests
 # ============================
 # CONFIGURATION
 # All values can be overridden with environment variables for portability.
+# Defaults are resolved relative to the script's own directory so the script
+# works correctly regardless of which directory you run it from.
 # ============================
 
+# Directory containing this script — used to anchor all default paths.
+SCRIPT_DIR = Path(__file__).resolve().parent
+
 # Path to a plain-text file with one SRU CQL query per line.
-QUERY_FILE = Path(os.environ.get("SRU_QUERY_FILE", "queries.txt"))
+QUERY_FILE = Path(os.environ.get("SRU_QUERY_FILE", SCRIPT_DIR / "queries.txt"))
 
 # Root directory for output MARCXML files (organised into daily sub-folders).
-OUTPUT_DIR = Path(os.environ.get("SRU_OUTPUT_DIR", "output"))
+OUTPUT_DIR = Path(os.environ.get("SRU_OUTPUT_DIR", SCRIPT_DIR / "output"))
 
 # Directory for persistent logs and the seen-IDs deduplication file.
-LOG_DIR = Path(os.environ.get("SRU_LOG_DIR", "logs"))
+LOG_DIR = Path(os.environ.get("SRU_LOG_DIR", SCRIPT_DIR / "logs"))
 
 # LC SRU base URL (Z39.50/SRU gateway).
 BASE_URL = os.environ.get("SRU_BASE_URL", "http://lx2.loc.gov:210/lcdb")
@@ -40,7 +44,7 @@ MIN_DELAY = int(os.environ.get("SRU_MIN_DELAY", 8))
 MAX_DELAY = int(os.environ.get("SRU_MAX_DELAY", 12))
 
 MAX_RETRIES = int(os.environ.get("SRU_MAX_RETRIES", 3))
-BACKOFF_BASE = int(os.environ.get("SRU_BACKOFF_BASE", 5))
+BACKOFF_BASE = int(os.environ.get("SRU_BACKOFF_BASE", 6))
 
 USER_AGENT = "LCSRUHarvester/1.0 (+https://example.org)"
 
@@ -294,7 +298,6 @@ def main() -> None:
 
     logging.info("=== Completed daily SRU harvesting run ===")
     print("\n*** DONE ***")
-
 
 if __name__ == "__main__":
     main()
