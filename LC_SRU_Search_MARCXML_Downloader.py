@@ -10,12 +10,15 @@ import re
 import time
 import random
 import unicodedata
-import urllib.parse
-import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
 import requests
+
+try:
+    from defusedxml import ElementTree as ET  # safer XML parsing
+except ImportError:
+    import xml.etree.ElementTree as ET  # fallback if defusedxml not installed
 
 # ============================
 # CONFIGURATION
@@ -37,6 +40,7 @@ OUTPUT_DIR = Path(os.environ.get("SRU_OUTPUT_DIR", SCRIPT_DIR / "output"))
 LOG_DIR = Path(os.environ.get("SRU_LOG_DIR", SCRIPT_DIR / "logs"))
 
 # LC SRU base URL (Z39.50/SRU gateway).
+# Note: LC's SRU endpoint does not support HTTPS — http:// is intentional.
 BASE_URL = os.environ.get("SRU_BASE_URL", "http://lx2.loc.gov:210/lcdb")
 
 # Polite crawl delay range (seconds) – please be kind to LC's servers.
@@ -48,50 +52,40 @@ BACKOFF_BASE = int(os.environ.get("SRU_BACKOFF_BASE", 6))
 
 USER_AGENT = "LCSRUHarvester/1.0 (+https://example.org)"
 
-# Derived paths
-QUERY_LOG_CSV = LOG_DIR / "sru_query_log.csv"
-SEEN_IDS_CSV  = LOG_DIR / "seen_marc_ids.csv"
-LOG_FILE      = LOG_DIR / "sru_run_log.txt"
-
-TODAY_STR = datetime.now().strftime("%Y-%m-%d")
-
-NS_MARC = "{http://www.loc.gov/MARC21/slim}"
-
 # ============================
 # SETUP
 # ============================
 
-def setup() -> Path:
-    """Create required directories and configure logging. Returns today's output folder."""
+def setup() -> tuple[Path, Path, Path, str]:
+    """Create required directories, configure logging, and return runtime paths."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    query_log_csv = LOG_DIR / "sru_query_log.csv"
+    seen_ids_csv  = LOG_DIR / "seen_marc_ids.csv"
+    log_file      = LOG_DIR / "sru_run_log.txt"
+    day_folder    = OUTPUT_DIR / today
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    day_folder.mkdir(exist_ok=True)
 
     logging.basicConfig(
-        filename=str(LOG_FILE),
+        filename=str(log_file),
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
-    day_folder = OUTPUT_DIR / TODAY_STR
-    day_folder.mkdir(exist_ok=True)
-    return day_folder
+    return day_folder, query_log_csv, seen_ids_csv, today
 
 
 # ============================
 # CSV HELPERS
 # ============================
 
-CSV_HEADERS: dict[Path, list[str]] = {
-    QUERY_LOG_CSV: ["date", "query", "xml_file_path", "total_records",
-                    "new_records", "skipped_records", "error_message"],
-    SEEN_IDS_CSV:  ["record_id", "first_seen_date"],
-}
-
-def ensure_csv(path: Path) -> None:
+def ensure_csv(path: Path, header: list[str]) -> None:
     """Write the header row if the CSV does not yet exist or is empty."""
     if not path.exists() or path.stat().st_size == 0:
         with path.open("w", encoding="utf-8", newline="") as fh:
-            csv.writer(fh).writerow(CSV_HEADERS[path])
+            csv.writer(fh).writerow(header)
 
 
 def load_seen_ids(path: Path) -> set[str]:
@@ -107,14 +101,14 @@ def load_seen_ids(path: Path) -> set[str]:
     return seen
 
 
-def append_seen_ids(path: Path, new_ids: list[str]) -> None:
+def append_seen_ids(path: Path, new_ids: list[str], today: str) -> None:
     """Append newly harvested record IDs with today's date."""
     if not new_ids:
         return
     with path.open("a", encoding="utf-8", newline="") as fh:
         writer = csv.writer(fh)
         for rid in new_ids:
-            writer.writerow([rid, TODAY_STR])
+            writer.writerow([rid, today])
 
 
 # ============================
@@ -132,13 +126,11 @@ def query_to_filename(query: str) -> str:
     Convert a CQL query string into a safe, human-readable filename stem.
 
     Steps:
-      1. Decode any percent-encoding.
-      2. Strip characters illegal on Windows/macOS/Linux filesystems.
-      3. Collapse non-alphanumeric runs to underscores.
-      4. Normalise Unicode to ASCII.
+      1. Strip characters illegal on Windows/macOS/Linux filesystems.
+      2. Collapse non-alphanumeric runs to underscores.
+      3. Normalise Unicode to ASCII.
     """
-    name = urllib.parse.unquote(query)
-    name = re.sub(r'[\\/:*?"<>|]', " ", name)
+    name = re.sub(r'[\\/:*?"<>|]', " ", query)
     name = re.sub(r"[^A-Za-z0-9]+", " ", name)
     name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
     name = re.sub(r"\s+", "_", name).strip("_")
@@ -205,10 +197,11 @@ def parse_records(xml_text: str) -> list[tuple[str | None, ET.Element]]:
         return []
 
     results: list[tuple[str | None, ET.Element]] = []
-    for record in root.findall(f".//{NS_MARC}record"):
+    ns = "{http://www.loc.gov/MARC21/slim}"
+    for record in root.findall(f".//{ns}record"):
         record_id = next(
             (cf.text.strip()
-             for cf in record.findall(f"{NS_MARC}controlfield")
+             for cf in record.findall(f"{ns}controlfield")
              if cf.get("tag") == "001" and cf.text),
             None,
         )
@@ -218,7 +211,7 @@ def parse_records(xml_text: str) -> list[tuple[str | None, ET.Element]]:
 
 def build_marcxml_collection(records: list[ET.Element]) -> str:
     """Wrap a list of MARC record elements in a <collection> and serialise to UTF-8 XML."""
-    collection = ET.Element(f"{NS_MARC}collection")
+    collection = ET.Element("{http://www.loc.gov/MARC21/slim}collection")
     collection.extend(records)
     return ET.tostring(collection, encoding="utf-8", xml_declaration=True).decode("utf-8")
 
@@ -228,12 +221,13 @@ def build_marcxml_collection(records: list[ET.Element]) -> str:
 # ============================
 
 def main() -> None:
-    day_folder = setup()
+    day_folder, query_log_csv, seen_ids_csv, today = setup()
 
-    for csv_path in (QUERY_LOG_CSV, SEEN_IDS_CSV):
-        ensure_csv(csv_path)
+    ensure_csv(query_log_csv, ["date", "query", "xml_file_path", "total_records",
+                              "new_records", "skipped_records", "error_message"])
+    ensure_csv(seen_ids_csv, ["record_id", "first_seen_date"])
 
-    seen_ids = load_seen_ids(SEEN_IDS_CSV)
+    seen_ids = load_seen_ids(seen_ids_csv)
     logging.info("Loaded %d previously seen record IDs.", len(seen_ids))
 
     try:
@@ -243,7 +237,7 @@ def main() -> None:
         print(f"ERROR: Query file not found: {QUERY_FILE}")
         return
 
-    with QUERY_LOG_CSV.open("a", encoding="utf-8", newline="") as log_fh:
+    with query_log_csv.open("a", encoding="utf-8", newline="") as log_fh:
         log_writer = csv.writer(log_fh)
 
         for query in queries:
@@ -284,12 +278,12 @@ def main() -> None:
                     xml_file_path = str(out_file)
                     print(f"  → Wrote {new_count} new records to {out_file}")
                     logging.info("Wrote %d new records for query %r to %s", new_count, query, out_file)
-                    append_seen_ids(SEEN_IDS_CSV, new_ids)
+                    append_seen_ids(seen_ids_csv, new_ids, today)
                 else:
                     print("  → No new records found for this query.")
                     logging.info("No new records for query %r.", query)
 
-            log_writer.writerow([TODAY_STR, query, xml_file_path,
+            log_writer.writerow([today, query, xml_file_path,
                                   total, new_count, skipped, error_msg])
 
             delay = random.uniform(MIN_DELAY, MAX_DELAY)
@@ -298,6 +292,7 @@ def main() -> None:
 
     logging.info("=== Completed daily SRU harvesting run ===")
     print("\n*** DONE ***")
+
 
 if __name__ == "__main__":
     main()
